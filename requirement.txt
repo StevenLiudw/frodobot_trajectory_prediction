@@ -1,0 +1,13 @@
+torch
+torchvision
+numpy
+matplotlib
+opencv-python
+pandas
+tqdm
+dotenv
+# for gps label only
+geopy
+# for LLM labeling
+openai
+aiohttp
