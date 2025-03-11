@@ -6,8 +6,16 @@ opencv-python
 pandas
 tqdm
 dotenv
+scipy
+# compass calibration
+utm
+geomag
+# filter traj
+m3u8
+tqdm_multiprocess
 # for gps label only
 geopy
 # for LLM labeling
 openai
 aiohttp
+

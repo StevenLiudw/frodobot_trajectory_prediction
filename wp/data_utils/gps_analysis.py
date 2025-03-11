@@ -9,6 +9,10 @@ from collections import Counter, defaultdict
 import pandas as pd
 import time
 from geopy.geocoders import Nominatim
+import pytz
+from datetime import datetime
+from timezonefinder import TimezoneFinder
+import shutil
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -73,36 +77,48 @@ def process_gps_data(data_dir, output_dir="out/gps_stats"):
         gps_path = os.path.join(ride_dir, "gps_raw.pkl")
         meta_path = os.path.join(ride_dir, "meta.pkl")
         
-        # Skip if GPS data doesn't exist
-        if not os.path.exists(gps_path):
-            logger.warning(f"No GPS data found for {ride_name}")
-            continue
+        # if meta.pkl exists, skip
+        if not os.path.exists(meta_path):
         
-        try:
-            # Load GPS data and get average coordinates
-            avg_lat, avg_lon = load_gps_data(gps_path)
+            # Skip if GPS data doesn't exist
+            if not os.path.exists(gps_path):
+                logger.warning(f"No GPS data found for {ride_name}")
+                continue
             
-            # Get location information
-            city, country = get_location_info(avg_lat, avg_lon)
+            try:
+                # Load GPS data and get average coordinates
+                avg_lat, avg_lon = load_gps_data(gps_path)
+                
+                # Get location information
+                city, country = get_location_info(avg_lat, avg_lon)
+                
+                # Count frames in this ride
+                img_dir = os.path.join(ride_dir, "img")
+                if os.path.exists(img_dir):
+                    frame_count = len(glob.glob(os.path.join(img_dir, "*.jpg")))
+                else:
+                    frame_count = 0
+                
+                # Save metadata
+                metadata = {
+                    'latitude': avg_lat,
+                    'longitude': avg_lon,
+                    'city': city,
+                    'country': country,
+                    'frame_count': frame_count
+                }
+                
+                with open(meta_path, 'wb') as f:
+                    pickle.dump(metadata, f) 
+            except Exception as e:
+                logger.error(f"Error processing GPS data for {ride_name}: {e}")
             
-            # Count frames in this ride
-            img_dir = os.path.join(ride_dir, "img")
-            if os.path.exists(img_dir):
-                frame_count = len(glob.glob(os.path.join(img_dir, "*.jpg")))
-            else:
-                frame_count = 0
-            
-            # Save metadata
-            metadata = {
-                'latitude': avg_lat,
-                'longitude': avg_lon,
-                'city': city,
-                'country': country,
-                'frame_count': frame_count
-            }
-            
-            with open(meta_path, 'wb') as f:
-                pickle.dump(metadata, f)
+        else:
+            with open(meta_path, 'rb') as f:
+                metadata = pickle.load(f)
+                city = metadata['city']
+                country = metadata['country']
+                frame_count = metadata['frame_count']
             
             # Update counters
             location_counts[(city, country)] += 1
@@ -113,8 +129,7 @@ def process_gps_data(data_dir, output_dir="out/gps_stats"):
             
             logger.debug(f"Processed {ride_name}: {city}, {country}")
             
-        except Exception as e:
-            logger.error(f"Error processing GPS data for {ride_name}: {e}")
+       
     
     # Compile statistics
     stats = {
@@ -269,6 +284,7 @@ def collect_sampled_frames(data_dir, output_dir, total_samples, divide=None):
     """
     Collect all sampled frames and copy them to a specified output directory.
     Optionally divide the frames into N sub-folders with equal distribution.
+    Also saves the corresponding future waypoints for each frame.
     
     Args:
         data_dir (str): Path to the data directory
@@ -311,6 +327,27 @@ def collect_sampled_frames(data_dir, output_dir, total_samples, divide=None):
         # Source image path
         src_path = os.path.join(ride_dir, "img", f"{img_idx}.jpg")
         
+        # Load trajectory data to get waypoints
+        traj_path = os.path.join(ride_dir, "traj_data.pkl")
+        if not os.path.exists(traj_path):
+            logger.warning(f"No trajectory data found for {ride_dir}")
+            continue
+            
+        with open(traj_path, "rb") as f:
+            traj_data = pickle.load(f)
+            
+        # Get positions data
+        pos = traj_data["pos"]
+        
+        # Check if there are enough future waypoints
+        n_waypoints = 10  # Number of future waypoints to collect
+        if img_idx + n_waypoints >= len(pos):
+            logger.warning(f"Not enough future waypoints for {ride_dir}, frame {img_idx}")
+            continue
+            
+        # Extract the next n_waypoints
+        future_waypoints = pos[img_idx+1:img_idx+n_waypoints+1].copy()
+        
         # Determine destination path
         if divide and divide > 0:
             # Determine which sub-folder this frame goes into
@@ -320,19 +357,29 @@ def collect_sampled_frames(data_dir, output_dir, total_samples, divide=None):
         else:
             dest_folder = output_dir
         
+        os.makedirs(dest_folder, exist_ok=True)
+        
         # Create a unique filename using ride directory and frame index
         ride_name = os.path.basename(ride_dir)
         dest_filename = f"{ride_name}_{img_idx}.jpg"
         dest_path = os.path.join(dest_folder, dest_filename)
         
-        # Copy the file
+        # Create waypoints filename
+        waypoints_filename = f"{ride_name}_{img_idx}_waypoints.npy"
+        waypoints_path = os.path.join(dest_folder, waypoints_filename)
+        
+        # Copy the image file
         if os.path.exists(src_path):
             shutil.copy2(src_path, dest_path)
+            
+            # Save the waypoints
+            np.save(waypoints_path, future_waypoints)
+            
             copied_frames.append(dest_path)
         else:
             logger.warning(f"Source file not found: {src_path}")
     
-    logger.info(f"Collected {len(copied_frames)} frames to {output_dir}")
+    logger.info(f"Collected {len(copied_frames)} frames with waypoints to {output_dir}")
     return copied_frames
 
 def generate_location_report(data_dir, output_dir="out/gps_stats", output_file="location_report.csv"):
@@ -368,7 +415,12 @@ def generate_location_report(data_dir, output_dir="out/gps_stats", output_file="
         })
     
     country_df = pd.DataFrame(country_data)
-    country_df = country_df.sort_values('Frames', ascending=False)
+    
+    # Only sort if the DataFrame is not empty and contains the 'Frames' column
+    if not country_df.empty and 'Frames' in country_df.columns:
+        country_df = country_df.sort_values('Frames', ascending=False)
+    else:
+        logger.warning("Cannot sort DataFrame: either empty or missing 'Frames' column")
     
     # Save to CSV if output file is specified
     if output_file:
@@ -381,11 +433,186 @@ def generate_location_report(data_dir, output_dir="out/gps_stats", output_file="
     logger.info(f"Total rides: {stats['total_rides']}")
     logger.info(f"Total frames: {sum(stats['frame_counts_by_country'].values())}")
     logger.info(f"Unique countries: {stats['unique_countries']}")
-    logger.info(f"Top 5 countries by frame count:")
-    for _, row in country_df.head(5).iterrows():
-        logger.info(f"  {row['Country']}: {row['Frames']} frames ({row['Frames_Percentage']:.2f}%)")
+    
+    # Only print top countries if there are any
+    if not country_df.empty and 'Frames' in country_df.columns:
+        logger.info(f"Top 5 countries by frame count:")
+        for _, row in country_df.head(5).iterrows():
+            logger.info(f"  {row['Country']}: {row['Frames']} frames ({row['Frames_Percentage']:.2f}%)")
+    else:
+        logger.info("No country frame data available to display")
     
     return country_df
+
+def filter_night_rides(data_dir, output_dir="out/gps_stats"):
+    """
+    Filter out rides that were recorded during nighttime (7 PM to 7 AM local time).
+    
+    Args:
+        data_dir (str): Path to the data directory containing ride folders
+        output_dir (str): Directory to save output statistics
+    
+    Returns:
+        dict: Statistics about filtered rides
+    """
+    logger.info("Filtering out night-time rides (7 PM to 7 AM local time)...")
+    
+    # Find all ride directories
+    ride_dirs = sorted(glob.glob(os.path.join(data_dir, "ride_*")))
+    logger.info(f"Found {len(ride_dirs)} ride directories")
+    
+    # Initialize timezone finder
+    tf = TimezoneFinder()
+    
+    # Initialize statistics
+    stats = {
+        'total_rides': len(ride_dirs),
+        'night_rides': 0,
+        'day_rides': 0,
+        'no_gps_data': 0,
+        'no_timestamp_data': 0,
+        'processing_errors': 0,
+        'countries': {}  # Changed from defaultdict with lambda to regular dict
+    }
+    
+    # Process each ride
+    for ride_dir in tqdm(ride_dirs):
+        ride_name = os.path.basename(ride_dir)
+        gps_path = os.path.join(ride_dir, "gps_raw.pkl")
+        meta_path = os.path.join(ride_dir, "meta.pkl")
+        
+        try:
+            # Check if GPS data exists
+            if not os.path.exists(gps_path):
+                logger.warning(f"No GPS data found for {ride_name}")
+                stats['no_gps_data'] += 1
+                continue
+            
+            # Load or create metadata
+            metadata = {}
+            if os.path.exists(meta_path):
+                with open(meta_path, 'rb') as f:
+                    metadata = pickle.load(f)
+            else:
+                # Load GPS data and get average coordinates
+                avg_lat, avg_lon = load_gps_data(gps_path)
+                
+                # Get location information
+                city, country = get_location_info(avg_lat, avg_lon)
+                
+                # Count frames in this ride
+                img_dir = os.path.join(ride_dir, "img")
+                if os.path.exists(img_dir):
+                    frame_count = len(glob.glob(os.path.join(img_dir, "*.jpg")))
+                else:
+                    frame_count = 0
+                
+                metadata = {
+                    'latitude': avg_lat,
+                    'longitude': avg_lon,
+                    'city': city,
+                    'country': country,
+                    'frame_count': frame_count
+                }
+            
+            # Get timestamp data
+            traj_path = os.path.join(ride_dir, "traj_data.pkl")
+            if not os.path.exists(traj_path):
+                logger.warning(f"No trajectory data found for {ride_name}")
+                stats['no_timestamp_data'] += 1
+                continue
+                
+            with open(traj_path, 'rb') as f:
+                traj_data = pickle.load(f)
+                
+            if 'timestamps' not in traj_data or len(traj_data['timestamps']) == 0:
+                logger.warning(f"No timestamp data found in trajectory for {ride_name}")
+                stats['no_timestamp_data'] += 1
+                continue
+            
+            # Get the first timestamp (Unix timestamp in seconds)
+            unix_timestamp = traj_data['timestamps'][0]
+            
+            # Get timezone from coordinates
+            lat, lon = metadata.get('latitude'), metadata.get('longitude')
+            timezone_str = tf.timezone_at(lat=lat, lng=lon)
+            
+            if not timezone_str:
+                logger.warning(f"Could not determine timezone for {ride_name} at {lat}, {lon}")
+                timezone_str = 'UTC'  # Default to UTC if timezone can't be determined
+            
+            # Convert Unix timestamp to local time
+            timezone = pytz.timezone(timezone_str)
+            utc_time = datetime.utcfromtimestamp(unix_timestamp)
+            utc_time = pytz.utc.localize(utc_time)
+            local_time = utc_time.astimezone(timezone)
+            
+            # Add local time info to metadata
+            metadata['local_time'] = local_time.strftime('%Y-%m-%d %H:%M:%S')
+            metadata['timezone'] = timezone_str
+            metadata['hour_of_day'] = local_time.hour
+            metadata['is_night'] = local_time.hour >= 19 or local_time.hour < 7
+            
+            # Save updated metadata
+            with open(meta_path, 'wb') as f:
+                pickle.dump(metadata, f)
+            
+            # Check if it's nighttime (7 PM to 7 AM)
+            is_night = metadata['is_night']
+            country = metadata.get('country', 'Unknown')
+            
+            # Initialize country stats if not already present
+            if country not in stats['countries']:
+                stats['countries'][country] = {'day': 0, 'night': 0}
+            
+            if is_night:
+                stats['night_rides'] += 1
+                stats['countries'][country]['night'] += 1
+                logger.debug(f"Night ride detected: {ride_name} at {metadata['local_time']} in {country}")
+                
+                # Option to remove or move the night ride
+                # Uncomment one of these options if you want to actually remove the rides
+                
+                # Option 1: Delete the ride directory
+                # shutil.rmtree(ride_dir)
+                
+                # Option 2: Move to a "night_rides" directory
+                night_dir = os.path.join(os.path.dirname(data_dir), "night_rides")
+                os.makedirs(night_dir, exist_ok=True)
+                shutil.move(ride_dir, os.path.join(night_dir, ride_name))
+            else:
+                stats['day_rides'] += 1
+                stats['countries'][country]['day'] += 1
+                logger.debug(f"Day ride detected: {ride_name} at {metadata['local_time']} in {country}")
+            
+        except Exception as e:
+            logger.error(f"Error processing ride {ride_name}: {e}")
+            stats['processing_errors'] += 1
+    
+    # Save statistics
+    os.makedirs(output_dir, exist_ok=True)
+    stats_path = os.path.join(output_dir, "day_night_stats.pkl")
+    with open(stats_path, 'wb') as f:
+        pickle.dump(stats, f)
+    
+    # Print summary
+    logger.info(f"Day/Night filtering complete.")
+    logger.info(f"Total rides: {stats['total_rides']}")
+    logger.info(f"Day rides: {stats['day_rides']}")
+    logger.info(f"Night rides: {stats['night_rides']}")
+    logger.info(f"Rides without GPS data: {stats['no_gps_data']}")
+    logger.info(f"Rides without timestamp data: {stats['no_timestamp_data']}")
+    logger.info(f"Rides with processing errors: {stats['processing_errors']}")
+    
+    # Print country breakdown
+    logger.info("Country breakdown (day/night):")
+    for country, counts in sorted(stats['countries'].items(), key=lambda x: x[1]['day'] + x[1]['night'], reverse=True):
+        total = counts['day'] + counts['night']
+        if total > 0:
+            night_percent = (counts['night'] / total) * 100
+            logger.info(f"  {country}: {counts['day']} day, {counts['night']} night ({night_percent:.1f}% night)")
+    
+    return stats
 
 if __name__ == "__main__":
     import argparse
@@ -399,6 +626,7 @@ if __name__ == "__main__":
     parser.add_argument("--collect", action="store_true", help="Collect sampled frames to output directory")
     parser.add_argument("--collect_dir", default="out/sampled_frames", help="Directory to save collected frames")
     parser.add_argument("--divide", type=int, help="Divide collected frames into N sub-folders")
+    parser.add_argument("--filter_night", action="store_true", help="Filter out night-time rides (7 PM to 7 AM)")
     
     args = parser.parse_args()
     
@@ -409,6 +637,10 @@ if __name__ == "__main__":
     # Generate report if requested
     if args.report:
         report = generate_location_report(args.data_dir, output_dir=args.output_dir)
+    
+    # Filter night rides if requested
+    if args.filter_night:
+        night_stats = filter_night_rides(args.data_dir, output_dir=args.output_dir)
     
     # Sample frames if requested
     if args.sample > 0:

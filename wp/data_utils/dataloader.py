@@ -26,7 +26,7 @@ class TrajectoryDataset(Dataset):
         self,
         data_dir,
         ride_dirs=None,
-        n_waypoints=20,
+        n_waypoints=10,
         transform=None,
         p1=0.2,  # Prob for strategy 1: use one of the next N waypoints as goal
         p2=0.4,  # Prob for strategy 2: sample beyond N waypoints, no U-turns
@@ -38,6 +38,7 @@ class TrajectoryDataset(Dataset):
         min_goal_distance_strategy2=4, # roughly the max dist of strategy 1
         goal_angle_threshold=30, # max angle deviation in degrees (strategy 3)
         alignment_threshold_deg=30, # max angle deviation in degrees (strategy 2)
+        dummy_goal=False, # whether to use dummy goals for testing
         seed=42
     ):
         """
@@ -51,12 +52,13 @@ class TrajectoryDataset(Dataset):
             max_goal_distance (float): Maximum distance for sampled goals (strategy 3)
             min_goal_distance (float): Minimum distance for sampled goals (strategy 3)
             goal_angle_threshold (float): Maximum angle deviation in degrees (strategy 3)
-            preprocess (bool): Whether to preprocess data for faster loading
+            dummy_goal (bool): Whether to use dummy goals for testing
             seed (int): Random seed for reproducibility
         """
         self.data_dir = data_dir
         self.n_waypoints = n_waypoints
         self.transform = transform
+        self._dummy_goal = dummy_goal
         
         # Validate strategy probabilities
         assert abs(p1 + p2 + p3 - 1.0) < 1e-6, "Strategy probabilities must sum to 1"
@@ -443,6 +445,9 @@ class TrajectoryDataset(Dataset):
         Returns:
             tuple: (goal_pos, waypoints) or None if all strategies fail
         """
+        if self._dummy_goal:
+            return self._create_dummy_goal(traj_data, current_idx)
+        
         # first detect u-turns
         # if there is a u-turn, use strategy 1
         if self._detect_u_turn(traj_data, current_idx, current_idx + self.n_waypoints):
@@ -546,23 +551,16 @@ class TrajectoryDataset(Dataset):
             # Check for preprocessed waypoints
             preprocessed_path = os.path.join(ride_dir, "preprocessed", f"waypoints_{img_idx}.npy")
             
-            if os.path.exists(preprocessed_path):
-                # Load preprocessed waypoints
-                local_waypoints = np.load(preprocessed_path)
+            # Sample goal and get waypoints
+            goal_result = self._sample_goal(traj_data, img_idx)
+            
+            if goal_result is None:
+                return self._create_invalid_sample()
                 
-                # Sample goal
-                goal_result = self._sample_goal(traj_data, img_idx)
-            else:
-                # Sample goal and get waypoints
-                goal_result = self._sample_goal(traj_data, img_idx)
-                
-                if goal_result is None:
-                    return self._create_invalid_sample()
-                    
-                goal_pos, next_waypoints = goal_result
-                
-                # Transform waypoints to local frame
-                local_waypoints = self._transform_to_local_frame(next_waypoints, current_pos, current_yaw)
+            goal_pos, next_waypoints = goal_result
+            
+            # Transform waypoints to local frame
+            local_waypoints = self._transform_to_local_frame(next_waypoints, current_pos, current_yaw)
                 
             if goal_result is None:
                 return self._create_invalid_sample()
@@ -623,6 +621,29 @@ class TrajectoryDataset(Dataset):
             'waypoints': waypoints,
             'goal': goals,
         }
+
+    def _create_dummy_goal(self, traj_data, current_idx):
+        """
+        Create a dummy goal for testing purposes.
+        
+        Args:
+            traj_data (dict): Trajectory data
+            current_idx (int): Current index in the trajectory
+            
+        Returns:
+            tuple: (goal_pos, waypoints)
+        """
+        pos = traj_data["pos"]
+        
+        # Get the next N waypoints
+        next_waypoints = pos[current_idx+1:current_idx+self.n_waypoints+1].copy()
+        
+        goal_pos = np.array([10, 10])
+        
+        return goal_pos, next_waypoints
+    
+    def shuffle(self):
+        random.shuffle(self.samples)
 
 
 def create_trajectory_dataloader(
@@ -867,9 +888,216 @@ def visualize_trajectory_samples(
     
     print(f"Visualization complete. {sample_count} images saved to {output_dir}")
 
-# Example usage
 
+def analyze_waypoint_statistics(
+    data_dir,
+    output_dir="out/analysis",
+    n_waypoints=10,
+    num_samples=10000,
+    batch_size=200,
+    seed=42
+):
+    """
+    Analyze statistics of waypoint trajectories using PyTorch with CUDA acceleration.
     
+    Args:
+        data_dir (str): Path to the data directory
+        output_dir (str): Directory to save analysis results
+        n_waypoints (int): Number of waypoints to analyze
+        num_samples (int): Number of samples to process
+        batch_size (int): Batch size for processing
+        seed (int): Random seed for reproducibility
+        
+    Returns:
+        dict: Statistics including mean and std of path lengths
+    """
+    # Set up dataset
+    dataset = TrajectoryDataset(
+        data_dir=data_dir,
+        n_waypoints=n_waypoints,
+        transform=None,
+        seed=seed,
+        dummy_goal=True
+    )
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        collate_fn=dataset.collate_fn,
+        pin_memory=True  # Speed up data transfer to GPU
+    )
+    
+    # Check if CUDA is available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+    
+    # Initialize tensors to store measurements
+    total_path_lengths = []
+    direct_distances = []
+    segment_distances_all = []  # Store all segment distances for all samples
+    
+    # Process samples
+    sample_count = 0
+    logger.info(f"Analyzing waypoint statistics for {n_waypoints} waypoints...")
+    
+    for batch in tqdm(dataloader, total=min(num_samples // batch_size + 1, len(dataloader))):
+        # Skip if batch is None (all invalid samples)
+        if batch is None:
+            continue
+            
+        # Extract waypoints and move to device
+        waypoints_batch = batch['waypoints'].to(device)  # Shape: [B, N, 2]
+        batch_size_actual = waypoints_batch.shape[0]
+        
+        # Calculate segments between consecutive waypoints
+        segments = waypoints_batch[:, 1:] - waypoints_batch[:, :-1]  # [B, N-1, 2]
+        segment_lengths = torch.sqrt(torch.sum(segments**2, dim=2))  # [B, N-1]
+        
+        # Calculate total path lengths
+        batch_path_lengths = torch.sum(segment_lengths, dim=1)  # [B]
+        
+        # Calculate direct distances (start to end)
+        batch_direct_distances = torch.sqrt(torch.sum(
+            (waypoints_batch[:, -1] - waypoints_batch[:, 0])**2, 
+            dim=1
+        ))  # [B]
+        
+        # Store all segment distances for statistics
+        segment_distances_all.append(segment_lengths.cpu())
+        
+        # Move results back to CPU and convert to numpy for storage
+        total_path_lengths.extend(batch_path_lengths.cpu().numpy().tolist())
+        direct_distances.extend(batch_direct_distances.cpu().numpy().tolist())
+        
+        sample_count += batch_size_actual
+        if sample_count >= num_samples:
+            # Trim to exact number of samples requested
+            total_path_lengths = total_path_lengths[:num_samples]
+            direct_distances = direct_distances[:num_samples]
+            sample_count = num_samples
+            break
+    
+    # Convert to numpy arrays for statistics calculation
+    total_path_lengths = np.array(total_path_lengths)
+    direct_distances = np.array(direct_distances)
+    
+    # Concatenate all segment distances and convert to numpy
+    all_segments = torch.cat(segment_distances_all, dim=0).numpy()
+    
+    # Calculate per-segment statistics
+    segment_stats = {
+        'mean': float(np.mean(all_segments)),
+        'std': float(np.std(all_segments)),
+        'min': float(np.min(all_segments)),
+        'max': float(np.max(all_segments)),
+        'median': float(np.median(all_segments)),
+        'per_position': []
+    }
+    
+    # Calculate statistics for each segment position
+    for i in range(all_segments.shape[1]):
+        segment_i = all_segments[:, i]
+        segment_stats['per_position'].append({
+            'position': i,
+            'mean': float(np.mean(segment_i)),
+            'std': float(np.std(segment_i)),
+            'min': float(np.min(segment_i)),
+            'max': float(np.max(segment_i)),
+            'median': float(np.median(segment_i))
+        })
+    
+    # Calculate path directness ratio (direct distance / total path length)
+    directness_ratios = direct_distances / total_path_lengths
+    
+    stats = {
+        'total_path_length': {
+            'mean': float(np.mean(total_path_lengths)),
+            'std': float(np.std(total_path_lengths)),
+            'min': float(np.min(total_path_lengths)),
+            'max': float(np.max(total_path_lengths)),
+            'median': float(np.median(total_path_lengths))
+        },
+        'direct_distance': {
+            'mean': float(np.mean(direct_distances)),
+            'std': float(np.std(direct_distances)),
+            'min': float(np.min(direct_distances)),
+            'max': float(np.max(direct_distances)),
+            'median': float(np.median(direct_distances))
+        },
+        'directness_ratio': {
+            'mean': float(np.mean(directness_ratios)),
+            'std': float(np.std(directness_ratios)),
+            'min': float(np.min(directness_ratios)),
+            'max': float(np.max(directness_ratios)),
+            'median': float(np.median(directness_ratios))
+        },
+        'segment_distances': segment_stats,
+        'num_samples': sample_count
+    }
+    
+    # Print summary
+    logger.info(f"Waypoint Statistics Summary (n={sample_count}):")
+    logger.info(f"Total Path Length: {stats['total_path_length']['mean']:.2f} ± {stats['total_path_length']['std']:.2f}")
+    logger.info(f"Direct Distance: {stats['direct_distance']['mean']:.2f} ± {stats['direct_distance']['std']:.2f}")
+    logger.info(f"Directness Ratio: {stats['directness_ratio']['mean']:.2f} ± {stats['directness_ratio']['std']:.2f}")
+    logger.info(f"Segment Distance: {stats['segment_distances']['mean']:.2f} ± {stats['segment_distances']['std']:.2f}")
+    
+    # Create histogram plots
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    
+    axes[0, 0].hist(total_path_lengths, bins=30, alpha=0.7)
+    axes[0, 0].set_title('Total Path Length Distribution')
+    axes[0, 0].set_xlabel('Length')
+    axes[0, 0].set_ylabel('Frequency')
+    
+    axes[0, 1].hist(direct_distances, bins=30, alpha=0.7)
+    axes[0, 1].set_title('Direct Distance Distribution')
+    axes[0, 1].set_xlabel('Distance')
+    axes[0, 1].set_ylabel('Frequency')
+    
+    axes[1, 0].hist(directness_ratios, bins=30, alpha=0.7)
+    axes[1, 0].set_title('Directness Ratio Distribution')
+    axes[1, 0].set_xlabel('Ratio (Direct/Total)')
+    axes[1, 0].set_ylabel('Frequency')
+    
+    axes[1, 1].hist(all_segments.flatten(), bins=30, alpha=0.7)
+    axes[1, 1].set_title('Segment Distance Distribution')
+    axes[1, 1].set_xlabel('Distance')
+    axes[1, 1].set_ylabel('Frequency')
+    
+    plt.tight_layout()
+    os.makedirs(output_dir, exist_ok=True)
+    plt.savefig(os.path.join(output_dir, f"waypoint_stats_n{n_waypoints}.png"), dpi=150)
+    plt.close(fig)
+    
+    # Create a plot for segment distances by position
+    plt.figure(figsize=(12, 6))
+    positions = [stat['position'] for stat in segment_stats['per_position']]
+    means = [stat['mean'] for stat in segment_stats['per_position']]
+    stds = [stat['std'] for stat in segment_stats['per_position']]
+    
+    plt.errorbar(positions, means, yerr=stds, fmt='o-', capsize=5)
+    plt.title('Segment Distance by Position')
+    plt.xlabel('Segment Position')
+    plt.ylabel('Distance (mean ± std)')
+    plt.grid(True, alpha=0.3)
+    plt.savefig(os.path.join(output_dir, f"segment_distances_n{n_waypoints}.png"), dpi=150)
+    plt.close()
+    
+    # Save statistics to file
+    with open(os.path.join(output_dir, f"waypoint_stats_n{n_waypoints}.pkl"), "wb") as f:
+        pkl.dump(stats, f)
+    
+    return stats
+
+def main():
+    data_dir = "data/filtered_2k"
+    analyze_waypoint_statistics(data_dir)
+
+if __name__ == "__main__":
+    main()
 
 # # Usage example
 # if __name__ == "__main__":

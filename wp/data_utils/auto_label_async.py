@@ -159,13 +159,14 @@ class AsyncWaypointLabeler:
             data_dir=self.data_dir,
             n_waypoints=self.n_waypoints,
             transform=transform,
-            seed=self.seed
+            seed=self.seed,
+            dummy_goal=True
         )
         
         # Shuffle the dataset samples if requested
         if self.shuffle:
             logger.info("Shuffling dataset samples")
-            random.shuffle(self.dataset.samples)
+            self.dataset.shuffle()
         
         logger.info(f"Initialized dataset with {len(self.dataset)} samples")
         
@@ -602,37 +603,44 @@ class AsyncWaypointLabeler:
         self.rate_limit_lock = asyncio.Lock()
         self.request_timestamps = []
         
-        # Create a list of tasks to process
-        logger.info(f"Creating {len(self.dataset)} tasks")
-        tasks = []
-        for sample_idx in range(min(len(self.dataset), self.max_labels)):
-            tasks.append(self._process_sample(sample_idx))
+        # Process samples in batches
+        batch_size = 100  # Process 100 samples at a time
+        total_samples = min(len(self.dataset), self.max_labels)
         
-        # Create a progress bar
-        pbar = tqdm(total=len(tasks))
+        # Create a progress bar for the entire process
+        pbar = tqdm(total=total_samples)
         
-        # Process tasks in batches to update progress bar
-        results = []
-        for task in asyncio.as_completed(tasks):
-            result = await task
-            results.append(result)
+        # Process in batches
+        for batch_start in range(0, total_samples, batch_size):
+            batch_end = min(batch_start + batch_size, total_samples)
+            logger.info(f"Processing batch {batch_start} to {batch_end-1}")
             
-            # Update counters based on result status
-            if result["status"] == "success":
-                labeled_count += 1
-            elif result["status"] == "skipped":
-                skipped_count += 1
-                if result["reason"] == "insufficient_waypoints":
-                    insufficient_waypoints_count += 1
-            elif result["status"] == "error":
-                error_count += 1
+            # Create tasks for this batch
+            batch_tasks = []
+            for sample_idx in range(batch_start, batch_end):
+                batch_tasks.append(self._process_sample(sample_idx))
             
-            # Update progress bar
-            pbar.update(1)
+            # Process batch tasks
+            batch_results = []
+            for task in asyncio.as_completed(batch_tasks):
+                result = await task
+                batch_results.append(result)
+                
+                # Update counters based on result status
+                if result["status"] == "success":
+                    labeled_count += 1
+                elif result["status"] == "skipped":
+                    skipped_count += 1
+                    if result["reason"] == "insufficient_waypoints":
+                        insufficient_waypoints_count += 1
+                elif result["status"] == "error":
+                    error_count += 1
+                
+                # Update progress bar
+                pbar.update(1)
             
-            # Log progress periodically
-            if len(results) % 10 == 0:
-                logger.info(f"Processed {len(results)} samples, labeled {labeled_count}, skipped {skipped_count}, errors {error_count}")
+            # Log progress after each batch
+            logger.info(f"Completed batch. Total processed: {batch_end}, labeled {labeled_count}, skipped {skipped_count}, errors {error_count}")
         
         pbar.close()
         
@@ -720,33 +728,40 @@ async def process_subset(labeler, sample_indices):
     labeler.rate_limit_lock = asyncio.Lock()
     labeler.request_timestamps = []
     
-    # Create a list of tasks to process
-    logger.info(f"Creating {len(sample_indices)} tasks for subset")
-    tasks = []
-    for sample_idx in sample_indices:
-        tasks.append(labeler._process_sample(sample_idx))
+    # Process samples in batches
+    batch_size = 100  # Process 100 samples at a time
+    total_samples = len(sample_indices)
     
     # Create a progress bar
-    pbar = tqdm(total=len(tasks), position=0, leave=True)
+    pbar = tqdm(total=total_samples, position=0, leave=True)
     
-    # Process tasks
-    results = []
-    for task in asyncio.as_completed(tasks):
-        result = await task
-        results.append(result)
+    # Process in batches
+    for batch_start in range(0, total_samples, batch_size):
+        batch_end = min(batch_start + batch_size, total_samples)
+        logger.info(f"Processing batch {batch_start} to {batch_end-1} in thread")
         
-        # Update counters based on result status
-        if result["status"] == "success":
-            labeled_count += 1
-        elif result["status"] == "skipped":
-            skipped_count += 1
-            if result["reason"] == "insufficient_waypoints":
-                insufficient_waypoints_count += 1
-        elif result["status"] == "error":
-            error_count += 1
+        # Create tasks for this batch
+        batch_tasks = []
+        for i in range(batch_start, batch_end):
+            sample_idx = sample_indices[i]
+            batch_tasks.append(labeler._process_sample(sample_idx))
         
-        # Update progress bar
-        pbar.update(1)
+        # Process batch tasks
+        for task in asyncio.as_completed(batch_tasks):
+            result = await task
+            
+            # Update counters based on result status
+            if result["status"] == "success":
+                labeled_count += 1
+            elif result["status"] == "skipped":
+                skipped_count += 1
+                if result["reason"] == "insufficient_waypoints":
+                    insufficient_waypoints_count += 1
+            elif result["status"] == "error":
+                error_count += 1
+            
+            # Update progress bar
+            pbar.update(1)
     
     pbar.close()
     
