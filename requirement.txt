@@ -18,4 +18,6 @@ geopy
 # for LLM labeling
 openai
 aiohttp
+huggingface_hub
+
 

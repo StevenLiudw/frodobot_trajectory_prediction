@@ -284,7 +284,7 @@ def collect_sampled_frames(data_dir, output_dir, total_samples, divide=None):
     """
     Collect all sampled frames and copy them to a specified output directory.
     Optionally divide the frames into N sub-folders with equal distribution.
-    Also saves the corresponding future waypoints for each frame.
+    Also saves the corresponding future waypoints for each frame in the local frame.
     
     Args:
         data_dir (str): Path to the data directory
@@ -348,6 +348,13 @@ def collect_sampled_frames(data_dir, output_dir, total_samples, divide=None):
         # Extract the next n_waypoints
         future_waypoints = pos[img_idx+1:img_idx+n_waypoints+1].copy()
         
+        # Get current position and orientation for local frame transformation
+        current_pos = pos[img_idx].copy()
+        current_yaw = traj_data["yaw"][img_idx]
+        
+        # Transform waypoints to local frame
+        local_waypoints = _transform_to_local_frame(future_waypoints, current_pos, current_yaw)
+        
         # Determine destination path
         if divide and divide > 0:
             # Determine which sub-folder this frame goes into
@@ -373,7 +380,7 @@ def collect_sampled_frames(data_dir, output_dir, total_samples, divide=None):
             shutil.copy2(src_path, dest_path)
             
             # Save the waypoints
-            np.save(waypoints_path, future_waypoints)
+            np.save(waypoints_path, local_waypoints)
             
             copied_frames.append(dest_path)
         else:
@@ -381,6 +388,36 @@ def collect_sampled_frames(data_dir, output_dir, total_samples, divide=None):
     
     logger.info(f"Collected {len(copied_frames)} frames with waypoints to {output_dir}")
     return copied_frames
+
+def _transform_to_local_frame(waypoints, current_pos, current_yaw):
+    """
+    Transform waypoints from global to local reference frame.
+    
+    Args:
+        waypoints (np.ndarray): Array of waypoints (Nx2)
+        current_pos (np.ndarray): Current position (x, y)
+        current_yaw (float): Current orientation in radians
+        
+    Returns:
+        np.ndarray: Transformed waypoints in local frame
+    """
+    # Ensure inputs are numpy arrays
+    waypoints = np.asarray(waypoints)
+    current_pos = np.asarray(current_pos)
+    
+    # Translate waypoints relative to current position
+    translated = waypoints - current_pos
+    
+    # Create rotation matrix
+    # Note: we rotate counter to the vehicle orientation to get local frame
+    cos_theta = np.cos(-current_yaw)
+    sin_theta = np.sin(-current_yaw)
+    R = np.array([[cos_theta, -sin_theta], [sin_theta, cos_theta]])
+    
+    # Apply rotation (vectorized operation)
+    transformed = np.matmul(translated, R.T)
+    
+    return transformed
 
 def generate_location_report(data_dir, output_dir="out/gps_stats", output_file="location_report.csv"):
     """
