@@ -1,9 +1,9 @@
 
 ## Install SAM
 ```
-git clone https://github.com/facebookresearch/sam2.git && cd sam2
+cd third_party && git clone https://github.com/facebookresearch/sam2.git && cd sam2
 
-pip install -e .
+pip install -e . && cd ..
 ```
 
 
@@ -38,4 +38,16 @@ python -m wp.data_utils.auto_label_async --max_labels 10000 --visualization_prob
 python wp/data_utils/check_labels.py --data_dir data/filtered_2k --visualize
 ```
 
-### Manual labeling
+### Segmentation labeling
+
+```bash
+python wp/data_utils/label_seg.py --interactive --compute_background --overwrite
+```
+
+### Upload / download from hf
+
+```bash
+# make sure the repo is set correctly, and set your hf token by --token
+python wp/data_utils/hf_utils.py --upload
+```
+Alternatively, you can directly download a subset https://huggingface.co/datasets/jamiewjm/fd/tree/main

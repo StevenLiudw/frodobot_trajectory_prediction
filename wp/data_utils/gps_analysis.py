@@ -611,12 +611,12 @@ def filter_night_rides(data_dir, output_dir="out/gps_stats"):
                 # Uncomment one of these options if you want to actually remove the rides
                 
                 # Option 1: Delete the ride directory
-                # shutil.rmtree(ride_dir)
+                shutil.rmtree(ride_dir)
                 
-                # Option 2: Move to a "night_rides" directory
-                night_dir = os.path.join(os.path.dirname(data_dir), "night_rides")
-                os.makedirs(night_dir, exist_ok=True)
-                shutil.move(ride_dir, os.path.join(night_dir, ride_name))
+                # # Option 2: Move to a "night_rides" directory
+                # night_dir = os.path.join(os.path.dirname(data_dir), "night_rides")
+                # os.makedirs(night_dir, exist_ok=True)
+                # shutil.move(ride_dir, os.path.join(night_dir, ride_name))
             else:
                 stats['day_rides'] += 1
                 stats['countries'][country]['day'] += 1
