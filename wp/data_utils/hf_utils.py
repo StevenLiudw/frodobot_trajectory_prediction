@@ -9,12 +9,13 @@ import dotenv
 
 dotenv.load_dotenv()
 
-def zip_subset_folders(base_dir: str = "out/sampled_frames_1/") -> List[str]:
+def zip_subset_folders(base_dir: str = "out/sampled_frames_1/", whole_zip: bool = False) -> List[str]:
     """
-    Zip each subset folder in the base directory.
+    Zip each subset folder in the base directory or zip the entire directory.
     
     Args:
         base_dir: Directory containing subset folders
+        whole_zip: If True, zip the entire directory instead of individual subset folders
         
     Returns:
         List of paths to created zip files
@@ -25,21 +26,35 @@ def zip_subset_folders(base_dir: str = "out/sampled_frames_1/") -> List[str]:
     
     zip_files = []
     
-    # Find all subset folders
-    subset_folders = [d for d in base_path.iterdir() if d.is_dir() and d.name.startswith("subset_")]
-    
-    for folder in subset_folders:
-        zip_path = folder.with_suffix('.zip')
+    if whole_zip:
+        # Zip the entire directory
+        zip_path = base_path.with_suffix('.zip')
         print(f"Creating {zip_path}...")
         
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for root, _, files in os.walk(folder):
+            for root, _, files in os.walk(base_path):
                 for file in files:
                     file_path = os.path.join(root, file)
-                    arcname = os.path.relpath(file_path, base_path)
+                    arcname = os.path.relpath(file_path, base_path.parent)
                     zipf.write(file_path, arcname)
         
         zip_files.append(str(zip_path))
+    else:
+        # Find all subset folders
+        subset_folders = [d for d in base_path.iterdir() if d.is_dir() and d.name.startswith("subset_")]
+        
+        for folder in subset_folders:
+            zip_path = folder.with_suffix('.zip')
+            print(f"Creating {zip_path}...")
+            
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for root, _, files in os.walk(folder):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.relpath(file_path, base_path)
+                        zipf.write(file_path, arcname)
+            
+            zip_files.append(str(zip_path))
     
     return zip_files
 
@@ -148,11 +163,13 @@ def main():
                         help="Download dataset from Hugging Face")
     parser.add_argument("--output_dir", default="out/sampled_frames_1/", 
                         help="Directory to extract downloaded dataset")
+    parser.add_argument("--whole_zip", action="store_true",
+                        help="Zip the entire directory instead of individual subset folders")
     
     args = parser.parse_args()
     
     if args.upload:
-        zip_files = zip_subset_folders(args.base_dir)
+        zip_files = zip_subset_folders(args.base_dir, args.whole_zip)
         if zip_files:
             upload_dataset(zip_files, args.repo_id, args.token)
     

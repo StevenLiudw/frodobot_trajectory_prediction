@@ -36,10 +36,10 @@ def load_sampled_frame_and_waypoints(frame_path):
     
     # Check if waypoints file exists
     if not os.path.exists(waypoints_path):
-        raise FileNotFoundError(f"Waypoints file not found: {waypoints_path}")
-    
-    # Load the waypoints
-    waypoints = np.load(waypoints_path)
+        waypoints = None
+    else:
+        # Load the waypoints
+        waypoints = np.load(waypoints_path)
     
     return image, waypoints
 
@@ -267,7 +267,10 @@ def process_interactive_mode(frames_dir, output_dir, limit=None, compute_backgro
             image, waypoints = load_sampled_frame_and_waypoints(frame_path)
             
             # Project waypoints to image
-            projected_waypoints = project_waypoints_to_image(waypoints, image.shape)
+            if waypoints is not None:
+                projected_waypoints = project_waypoints_to_image(waypoints, image.shape)
+            else:
+                projected_waypoints = np.zeros((0, 2))
             
             logger.info(f"Processing {frame_path} in interactive mode")
             print(f"\nFrame: {frame_name}")
@@ -313,7 +316,10 @@ def process_interactive_mode(frames_dir, output_dir, limit=None, compute_backgro
                             try:
                                 # Load and check if the next frame has valid waypoints
                                 next_image, next_waypoints = load_sampled_frame_and_waypoints(next_frame_path)
-                                next_projected_waypoints = project_waypoints_to_image(next_waypoints, next_image.shape)
+                                if next_waypoints is not None:
+                                    next_projected_waypoints = project_waypoints_to_image(next_waypoints, next_image.shape)
+                                else:
+                                    next_projected_waypoints = np.zeros((0, 2))
                                 
                                 # Found a valid frame, precompute embeddings
                                 logger.info(f"Found next valid frame: {next_frame_path}, precomputing embeddings")
