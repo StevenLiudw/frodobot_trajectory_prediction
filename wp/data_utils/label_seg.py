@@ -422,10 +422,17 @@ def interactive_segmentation_with_predictor(image, initial_waypoints, output_dir
         user_points = np.zeros((0, 2))
         user_labels = np.array([], dtype=int)
 
-    # Initialize points and labels
-    # Store initial waypoints separately from user-added points
-    waypoints = initial_waypoints.copy() if len(initial_waypoints) > 0 else np.zeros((0, 2))
-    waypoint_labels = np.ones(len(waypoints), dtype=int)  # All initial waypoints are positive
+    DEFAULT_NO_WAYPOINTS = True
+    if not DEFAULT_NO_WAYPOINTS:
+        # Initialize points and labels
+        # Store initial waypoints separately from user-added points
+        waypoints = initial_waypoints.copy() if len(initial_waypoints) > 0 else np.zeros((0, 2))
+        waypoint_labels = np.ones(len(waypoints), dtype=int)  # All initial waypoints are positive
+    else:
+        waypoints = np.zeros((0, 2))
+        waypoint_labels = np.array([], dtype=int)
+        use_waypoints = False
+
 
     # For SAM2 prediction, we need to combine both sets of points
     points = np.vstack([waypoints, user_points]) if len(waypoints) > 0 else user_points.copy()

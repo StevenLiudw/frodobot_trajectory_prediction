@@ -160,11 +160,153 @@ def process_gps_data(data_dir, output_dir="out/gps_stats"):
     
     return stats
 
+def sample_frames(data_dir, total_samples, output_dir="out/gps_stats"):
+    """
+    Sample frames with diverse locations and orientations in a single pass.
+    Uses both GPS location and compass heading to ensure diversity.
+    
+    Args:
+        data_dir (str): Path to the data directory
+        total_samples (int): Total number of frames to sample
+        output_dir (str): Directory to save output statistics
+    
+    Returns:
+        list: List of sampled frame paths (ride_dir, img_idx, coords, heading)
+    """
+    logger.info(f"Sampling up to {total_samples} frames with diverse locations and orientations...")
+    
+    # Find all ride directories
+    ride_dirs = sorted(glob.glob(os.path.join(data_dir, "ride_*")))
+    logger.info(f"Found {len(ride_dirs)} ride directories")
+    
+    # Constants for Earth radius and conversion
+    EARTH_RADIUS_METERS = 6371000  # Earth's radius in meters
+    METERS_PER_DEGREE_LAT = EARTH_RADIUS_METERS * (np.pi / 180)  # ~111,000 meters per degree
+    TARGET_GRID_SIZE_METERS = 3  # Target grid size in meters
+    HEADING_GRID_SIZE_DEGREES = 20  # Divide 360 degrees into 8 bins
+    MAX_FRAMES_PER_CELL = 5
+    
+    # Use a spatial-heading grid for efficient proximity checking
+    location_heading_grid = defaultdict(int)  # Will return 0 for any new cell_key
+    
+    # Collect all available frames with GPS and compass data
+    all_frames = []
+    
+    for ride_dir in tqdm(ride_dirs, desc="Collecting frames with GPS and compass data"):
+        gps_path = os.path.join(ride_dir, "gps_raw.pkl")
+        compass_path = os.path.join(ride_dir, "compass_calibrated.pkl")
+        
+        # Skip if GPS data doesn't exist
+        if not os.path.exists(gps_path):
+            continue
+            
+        # Load GPS data
+        with open(gps_path, 'rb') as gps_f:
+            gps_data = pickle.load(gps_f)
+            latitudes = gps_data['latitude']
+            longitudes = gps_data['longitude']
+            gps_timestamps = gps_data['timestamp']
+        
+        # Load compass data if available
+        compass_headings = None
+        compass_timestamps = None
+        if os.path.exists(compass_path):
+            with open(compass_path, 'rb') as compass_f:
+                compass_data = pickle.load(compass_f)
+                # First column is heading angle in degrees, second is timestamp
+                compass_headings = compass_data[:, 0]
+                compass_timestamps = compass_data[:, 1]
+        
+        # Collect frames for this ride
+        img_dir = os.path.join(ride_dir, "img")
+        if os.path.exists(img_dir):
+            img_files = glob.glob(os.path.join(img_dir, "*.jpg"))
+            for img_file in img_files:
+                img_idx = int(os.path.basename(img_file).split('.')[0])
+                
+                # Find frame timestamp
+                traj_path = os.path.join(ride_dir, "traj_data.pkl")
+                if os.path.exists(traj_path):
+                    with open(traj_path, 'rb') as traj_f:
+                        traj_data = pickle.load(traj_f)
+                        if 'timestamps' in traj_data and len(traj_data['timestamps']) > img_idx:
+                            frame_timestamp = traj_data['timestamps'][img_idx]
+                            
+                            # Find closest GPS timestamp
+                            closest_gps_idx = np.argmin(np.abs(np.array(gps_timestamps) - frame_timestamp))
+                            lat = latitudes[closest_gps_idx]
+                            lon = longitudes[closest_gps_idx]
+                            
+                            # Find closest compass heading if available
+                            heading = None
+                            if compass_headings is not None and compass_timestamps is not None:
+                                closest_compass_idx = np.argmin(np.abs(np.array(compass_timestamps) - frame_timestamp))
+                                heading = compass_headings[closest_compass_idx]
+                            
+                            all_frames.append((ride_dir, img_idx, (lat, lon), heading))
+    
+    logger.info(f"Collected {len(all_frames)} frames with GPS data")
+    
+    # Shuffle all frames to ensure random selection
+    random.shuffle(all_frames)
+    
+    # Sample frames while respecting the GPS proximity and heading constraint
+    sampled_frames = []
+    
+    for frame in tqdm(all_frames, desc="Sampling diverse frames"):
+        ride_dir, img_idx, (lat, lon), heading = frame
+        
+        # Calculate grid size for longitude at this latitude
+        meters_per_degree_lon = METERS_PER_DEGREE_LAT * np.cos(np.radians(lat))
+        
+        # Calculate grid cell size in degrees
+        lat_grid_size = TARGET_GRID_SIZE_METERS / METERS_PER_DEGREE_LAT
+        lon_grid_size = TARGET_GRID_SIZE_METERS / meters_per_degree_lon if meters_per_degree_lon > 0 else lat_grid_size
+        
+        # Convert to grid cell coordinates
+        grid_x = int(lon / lon_grid_size)
+        grid_y = int(lat / lat_grid_size)
+        
+        # Add heading to grid if available
+        if heading is not None:
+            # Normalize heading to 0-360 range
+            heading = heading % 360
+            # Convert to grid cell
+            grid_heading = int(heading / HEADING_GRID_SIZE_DEGREES)
+            grid_key = (grid_x, grid_y, grid_heading)
+        else:
+            # If no heading data, just use location
+            grid_key = (grid_x, grid_y)
+        
+        # Check if this cell already has MAX_FRAMES_PER_CELL or more frames
+        if location_heading_grid[grid_key] >= MAX_FRAMES_PER_CELL:
+            continue
+  
+        sampled_frames.append((ride_dir, img_idx, (lat, lon), heading))
+        location_heading_grid[grid_key] += 1
+            
+        # Break if we've sampled enough frames
+        if len(sampled_frames) >= total_samples:
+            break
+    
+    logger.info(f"Sampled a total of {len(sampled_frames)} frames")
+    
+    # Save the sampled frames list
+    os.makedirs(output_dir, exist_ok=True)
+    sampled_frames_path = os.path.join(output_dir, f"sampled_frames_{total_samples}.pkl")
+    with open(sampled_frames_path, 'wb') as f:
+        pickle.dump(sampled_frames, f)
+    
+    logger.info(f"Saved frame list to {sampled_frames_path}")
+    
+    return sampled_frames
+
 def sample_balanced_frames(data_dir, total_samples, output_dir="out/gps_stats"):
     """
     Sample frames such that each country has equal representation in the final sample.
     If a country has fewer frames than needed, the remaining quota will be distributed
-    among other countries.
+    among other countries. Also ensures that within 10 meters of any GPS location, 
+    we only sample a maximum of 5 frames.
     
     Args:
         data_dir (str): Path to the data directory
@@ -200,50 +342,117 @@ def sample_balanced_frames(data_dir, total_samples, output_dir="out/gps_stats"):
     # Find all ride directories
     ride_dirs = sorted(glob.glob(os.path.join(data_dir, "ride_*")))
     
-    # Group rides by country and collect all available frames
+    # Group rides by country and collect all available frames with GPS data
     rides_by_country = defaultdict(list)
     frames_by_country = defaultdict(list)
     
-    for ride_dir in ride_dirs:
+    for ride_dir in tqdm(ride_dirs, desc="Collecting frames with GPS data"):
         meta_path = os.path.join(ride_dir, "meta.pkl")
-        if os.path.exists(meta_path):
-            with open(meta_path, 'rb') as f:
-                meta = pickle.load(f)
-                country = meta.get('country', 'Unknown')
-                if country in countries:
-                    rides_by_country[country].append(ride_dir)
-                    
-                    # Collect frames for this ride
-                    img_dir = os.path.join(ride_dir, "img")
-                    if os.path.exists(img_dir):
-                        img_files = glob.glob(os.path.join(img_dir, "*.jpg"))
-                        for img_file in img_files:
-                            img_idx = int(os.path.basename(img_file).split('.')[0])
-                            frames_by_country[country].append((ride_dir, img_idx))
+        gps_path = os.path.join(ride_dir, "gps_raw.pkl")
+        
+        if not os.path.exists(meta_path) or not os.path.exists(gps_path):
+            continue
+            
+        with open(meta_path, 'rb') as f:
+            meta = pickle.load(f)
+            country = meta.get('country', 'Unknown')
+            if country in countries:
+                rides_by_country[country].append(ride_dir)
+                
+                # Load GPS data
+                with open(gps_path, 'rb') as gps_f:
+                    gps_data = pickle.load(gps_f)
+                    latitudes = gps_data['latitude']
+                    longitudes = gps_data['longitude']
+                    timestamps = gps_data['timestamp']
+                
+                # Collect frames for this ride
+                img_dir = os.path.join(ride_dir, "img")
+                if os.path.exists(img_dir):
+                    img_files = glob.glob(os.path.join(img_dir, "*.jpg"))
+                    for img_file in img_files:
+                        img_idx = int(os.path.basename(img_file).split('.')[0])
+                        
+                        # Find closest timestamp in GPS data
+                        traj_path = os.path.join(ride_dir, "traj_data.pkl")
+                        if os.path.exists(traj_path):
+                            with open(traj_path, 'rb') as traj_f:
+                                traj_data = pickle.load(traj_f)
+                                if 'timestamps' in traj_data and len(traj_data['timestamps']) > img_idx:
+                                    frame_timestamp = traj_data['timestamps'][img_idx]
+                                    
+                                    # Find closest GPS timestamp
+                                    closest_idx = np.argmin(np.abs(np.array(timestamps) - frame_timestamp))
+                                    lat = latitudes[closest_idx]
+                                    lon = longitudes[closest_idx]
+                                    
+                                    frames_by_country[country].append((ride_dir, img_idx, (lat, lon)))
     
     # First pass: sample what we can from each country
     sampled_frames = []
     remaining_quota = 0
     
+    # Use a spatial grid for efficient proximity checking
+    # Each grid cell is approximately 10x10 meters
+    # We'll adjust longitude grid size based on latitude to account for Earth's curvature
+    location_grid = defaultdict(int)  # Will return 0 for any new cell_key
+    
+    # Constants for Earth radius and conversion
+    EARTH_RADIUS_METERS = 6371000  # Earth's radius in meters
+    METERS_PER_DEGREE_LAT = EARTH_RADIUS_METERS * (np.pi / 180)  # ~111,000 meters per degree
+    TARGET_GRID_SIZE_METERS = 3  # Target grid size in meters
+    MAX_FRAMES_PER_CELL = 5
+    
+    logger.info("Sampling frames with balanced distribution...")
     for country in countries:
         country_frames = frames_by_country[country]
         
-        if len(country_frames) <= samples_per_country:
-            # If we have fewer frames than needed, use all of them
-            country_sampled = country_frames
-            remaining_quota += (samples_per_country - len(country_frames))
-            logger.warning(f"Country {country} has only {len(country_frames)} frames, " 
-                          f"less than the {samples_per_country} requested")
-        else:
-            # Otherwise, randomly sample the required number
-            country_sampled = random.sample(country_frames, samples_per_country)
+        # Shuffle frames to ensure random selection
+        random.shuffle(country_frames)
         
+        # Sample frames while respecting the GPS proximity constraint
+        country_sampled = []
+        for frame in country_frames:
+            ride_dir, img_idx, (lat, lon) = frame
+            
+            # Calculate grid size for longitude at this latitude
+            # At the equator, 1 degree longitude = 111km, but this decreases with latitude
+            meters_per_degree_lon = METERS_PER_DEGREE_LAT * np.cos(np.radians(lat))
+            
+            # Calculate grid cell size in degrees
+            lat_grid_size = TARGET_GRID_SIZE_METERS / METERS_PER_DEGREE_LAT
+            lon_grid_size = TARGET_GRID_SIZE_METERS / meters_per_degree_lon if meters_per_degree_lon > 0 else lat_grid_size
+            
+            # Convert to grid cell coordinates
+            grid_x = int(lon / lon_grid_size)
+            grid_y = int(lat / lat_grid_size)
+            
+            # Check if this cell already has 5 or more frames
+            if location_grid[(grid_x, grid_y)] >= MAX_FRAMES_PER_CELL:
+                continue
+      
+            country_sampled.append((ride_dir, img_idx))
+            location_grid[(grid_x, grid_y)] += 1
+                
+            # Break if we've sampled enough frames
+            if len(country_sampled) >= samples_per_country:
+                break
+        
+        # If we couldn't sample enough frames, add to remaining quota
+        if len(country_sampled) < samples_per_country:
+            remaining_quota += (samples_per_country - len(country_sampled))
+            logger.warning(f"Country {country} has only {len(country_sampled)} valid frames, " 
+                          f"less than the {samples_per_country} requested")
+        
+        # Add sampled frames to the final list
         sampled_frames.extend(country_sampled)
         
         # Remove sampled frames from available frames
-        for frame in country_sampled:
-            if frame in frames_by_country[country]:
-                frames_by_country[country].remove(frame)
+        for ride_dir, img_idx in country_sampled:
+            frames_to_remove = [(r, i, coords) for r, i, coords in frames_by_country[country] if r == ride_dir and i == img_idx]
+            for f in frames_to_remove:
+                if f in frames_by_country[country]:
+                    frames_by_country[country].remove(f)
     
     # Second pass: distribute remaining quota among countries with extra frames
     if remaining_quota > 0:
@@ -260,27 +469,61 @@ def sample_balanced_frames(data_dir, total_samples, output_dir="out/gps_stats"):
             for i, country in enumerate(countries_with_extra):
                 # Add remainder to first few countries if needed
                 extra_to_take = extra_per_country + (1 if i < remainder else 0)
-                extra_to_take = min(extra_to_take, len(frames_by_country[country]))
                 
-                if extra_to_take > 0:
-                    extra_sampled = random.sample(frames_by_country[country], extra_to_take)
-                    sampled_frames.extend(extra_sampled)
-                    logger.info(f"Added {len(extra_sampled)} extra frames from {country}")
+                # Sample additional frames while respecting GPS proximity constraint
+                extra_sampled = []
+                for frame in frames_by_country[country]:
+                    ride_dir, img_idx, (lat, lon) = frame
+                    
+                    # Calculate grid size for longitude at this latitude
+                    meters_per_degree_lon = METERS_PER_DEGREE_LAT * np.cos(np.radians(lat))
+                    
+                    # Calculate grid cell size in degrees
+                    lat_grid_size = TARGET_GRID_SIZE_METERS / METERS_PER_DEGREE_LAT
+                    lon_grid_size = TARGET_GRID_SIZE_METERS / meters_per_degree_lon if meters_per_degree_lon > 0 else lat_grid_size
+                    
+                    # Convert to grid cell coordinates
+                    grid_x = int(lon / lon_grid_size)
+                    grid_y = int(lat / lat_grid_size)
+                    
+                    # Check if this cell already has 5 or more frames
+                    if location_grid[(grid_x, grid_y)] >= MAX_FRAMES_PER_CELL:
+                        continue
+
+                    extra_sampled.append((ride_dir, img_idx))
+                    location_grid[(grid_x, grid_y)] += 1
+                        
+                    # Break if we've sampled enough extra frames
+                    if len(extra_sampled) >= extra_to_take:
+                        break
+                
+                sampled_frames.extend(extra_sampled)
+                logger.info(f"Added {len(extra_sampled)} extra frames from {country}")
     
     # Shuffle the final list
     random.shuffle(sampled_frames)
     
-    # Save the sampled frames list
+    # Save the sampled frames list with GPS coordinates
+    sampled_frames_with_gps = []
+    for ride_dir, img_idx in sampled_frames:
+        # Find the GPS coordinates for this frame
+        for country in countries:
+            for frame in frames_by_country[country]:
+                if frame[0] == ride_dir and frame[1] == img_idx:
+                    sampled_frames_with_gps.append((ride_dir, img_idx, frame[2]))
+                    break
+    
     sampled_frames_path = os.path.join(output_dir, f"balanced_frames_{total_samples}.pkl")
     with open(sampled_frames_path, 'wb') as f:
-        pickle.dump(sampled_frames, f)
+        pickle.dump(sampled_frames_with_gps, f)
     
     logger.info(f"Sampled a total of {len(sampled_frames)} frames")
     logger.info(f"Saved balanced frame list to {sampled_frames_path}")
     
     return sampled_frames
 
-def collect_sampled_frames(data_dir, output_dir, total_samples, divide=None):
+
+def collect_sampled_frames(data_dir, output_dir, total_samples, divide=None, future_waypoints=10, balanced=True):
     """
     Collect all sampled frames and copy them to a specified output directory.
     Optionally divide the frames into N sub-folders with equal distribution.
@@ -295,13 +538,16 @@ def collect_sampled_frames(data_dir, output_dir, total_samples, divide=None):
     Returns:
         list: List of paths to the copied frames
     """
-    import shutil
     
     logger.info(f"Collecting sampled frames to {output_dir}...")
     
     # Get sampled frames
     stats_dir = os.path.join(os.path.dirname(output_dir), "gps_stats")
-    sampled_frames = sample_balanced_frames(data_dir, total_samples, output_dir=stats_dir)
+    if balanced:
+        sampled_frames = sample_balanced_frames(data_dir, total_samples, output_dir=stats_dir)
+    else:
+        logger.info("Not using balanced sampling")
+        sampled_frames = sample_frames(data_dir, total_samples, output_dir=stats_dir)
     
     if not sampled_frames:
         logger.error("No frames were sampled!")
@@ -323,37 +569,53 @@ def collect_sampled_frames(data_dir, output_dir, total_samples, divide=None):
     
     # Copy frames to output directory
     copied_frames = []
-    for i, (ride_dir, img_idx) in enumerate(sampled_frames):
+    for i, frame_data in enumerate(sampled_frames):
+        # Handle different return formats from sample_frames and sample_balanced_frames
+        if balanced:
+            if len(frame_data) == 3:  # (ride_dir, img_idx, coords)
+                ride_dir, img_idx, coords = frame_data
+                lat, lon = coords
+            else:  # Just (ride_dir, img_idx)
+                ride_dir, img_idx = frame_data
+                lat, lon = None, None
+        else:
+            if len(frame_data) == 4:  # (ride_dir, img_idx, coords, heading)
+                ride_dir, img_idx, coords, heading = frame_data
+                lat, lon = coords
+            else:  # Unexpected format
+                logger.warning(f"Unexpected frame data format: {frame_data}")
+                continue
+        
         # Source image path
         src_path = os.path.join(ride_dir, "img", f"{img_idx}.jpg")
         
-        # Load trajectory data to get waypoints
-        traj_path = os.path.join(ride_dir, "traj_data.pkl")
-        if not os.path.exists(traj_path):
-            logger.warning(f"No trajectory data found for {ride_dir}")
-            continue
+        if future_waypoints > 0:
+            # Load trajectory data to get waypoints
+            traj_path = os.path.join(ride_dir, "traj_data.pkl")
+            if not os.path.exists(traj_path):
+                logger.warning(f"No trajectory data found for {ride_dir}")
+                continue
+                
+            with open(traj_path, "rb") as f:
+                traj_data = pickle.load(f)
+                
+            # Get positions data
+            pos = traj_data["pos"]
             
-        with open(traj_path, "rb") as f:
-            traj_data = pickle.load(f)
+            # Check if there are enough future waypoints
+            if img_idx + future_waypoints >= len(pos):
+                logger.warning(f"Not enough future waypoints for {ride_dir}, frame {img_idx}")
+                continue
+                
+            # Extract the next n_waypoints
+            future_waypoints_data = pos[img_idx+1:img_idx+future_waypoints+1].copy()
             
-        # Get positions data
-        pos = traj_data["pos"]
-        
-        # Check if there are enough future waypoints
-        n_waypoints = 10  # Number of future waypoints to collect
-        if img_idx + n_waypoints >= len(pos):
-            logger.warning(f"Not enough future waypoints for {ride_dir}, frame {img_idx}")
-            continue
+            # Get current position and orientation for local frame transformation
+            current_pos = pos[img_idx].copy()
+            current_yaw = traj_data["yaw"][img_idx]
             
-        # Extract the next n_waypoints
-        future_waypoints = pos[img_idx+1:img_idx+n_waypoints+1].copy()
-        
-        # Get current position and orientation for local frame transformation
-        current_pos = pos[img_idx].copy()
-        current_yaw = traj_data["yaw"][img_idx]
-        
-        # Transform waypoints to local frame
-        local_waypoints = _transform_to_local_frame(future_waypoints, current_pos, current_yaw)
+            # Transform waypoints to local frame
+            local_waypoints = _transform_to_local_frame(future_waypoints_data, current_pos, current_yaw)
         
         # Determine destination path
         if divide and divide > 0:
@@ -371,22 +633,22 @@ def collect_sampled_frames(data_dir, output_dir, total_samples, divide=None):
         dest_filename = f"{ride_name}_{img_idx}.jpg"
         dest_path = os.path.join(dest_folder, dest_filename)
         
-        # Create waypoints filename
-        waypoints_filename = f"{ride_name}_{img_idx}_waypoints.npy"
-        waypoints_path = os.path.join(dest_folder, waypoints_filename)
-        
         # Copy the image file
         if os.path.exists(src_path):
             shutil.copy2(src_path, dest_path)
             
-            # Save the waypoints
-            np.save(waypoints_path, local_waypoints)
-            
             copied_frames.append(dest_path)
+
+            if future_waypoints > 0:
+                # Create waypoints filename
+                waypoints_filename = f"{ride_name}_{img_idx}_waypoints.npy"
+                waypoints_path = os.path.join(dest_folder, waypoints_filename)
+                # Save the waypoints
+                np.save(waypoints_path, local_waypoints)
         else:
             logger.warning(f"Source file not found: {src_path}")
     
-    logger.info(f"Collected {len(copied_frames)} frames with waypoints to {output_dir}")
+    logger.info(f"Collected {len(copied_frames)} frames to {output_dir}")
     return copied_frames
 
 def _transform_to_local_frame(waypoints, current_pos, current_yaw):
@@ -663,8 +925,9 @@ if __name__ == "__main__":
     parser.add_argument("--collect", action="store_true", help="Collect sampled frames to output directory")
     parser.add_argument("--collect_dir", default="out/sampled_frames", help="Directory to save collected frames")
     parser.add_argument("--divide", type=int, help="Divide collected frames into N sub-folders")
+    parser.add_argument("--future_waypoints", type=int, default=-1, help="Number of future waypoints to collect")
     parser.add_argument("--filter_night", action="store_true", help="Filter out night-time rides (7 PM to 7 AM)")
-    
+    parser.add_argument("--balanced", action="store_true", help="Use balanced sampling")
     args = parser.parse_args()
     
     # Process GPS data if requested
@@ -683,7 +946,13 @@ if __name__ == "__main__":
     if args.sample > 0:
         if args.collect:
             # Collect sampled frames
-            collect_sampled_frames(args.data_dir, args.collect_dir, args.sample, divide=args.divide)
+            collect_sampled_frames(
+                args.data_dir, 
+                args.collect_dir, 
+                args.sample, 
+                divide=args.divide, 
+                future_waypoints=args.future_waypoints, 
+                balanced=args.balanced)
         else:
             # Just sample frames without collecting
             sampled_frames = sample_balanced_frames(args.data_dir, args.sample, output_dir=args.output_dir)
