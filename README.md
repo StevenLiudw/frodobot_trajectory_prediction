@@ -48,7 +48,6 @@ Follow the steps below to create your environment, install required dependencies
    - **Left-click:** Add positive points (green)
    - **Ctrl+Left-click:** Add negative points (red)
    - **Press 'r':** Reset user-added points (keeps waypoints)
-   - **Press 'z':** Toggle invalid/valid trajectory
    - **Press 'x':** Remove all points (including waypoints)
    - **Press 'backspace':** Undo the last user-added point
    - **Press 'q':** Quit without saving
