@@ -15,6 +15,52 @@ import shutil
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def _safe_move_or_delete(path, trash_dir=None):
+    if not os.path.exists(path):
+        return
+    if trash_dir:
+        os.makedirs(trash_dir, exist_ok=True)
+        dst = os.path.join(trash_dir, os.path.basename(path))
+        try:
+            shutil.move(path, dst)
+        except Exception:
+            # If moving a dir/file into existing target name, fall back to unique name
+            base, ext = os.path.splitext(os.path.basename(path))
+            uniq = f"{base}_{int(time.time())}{ext}"
+            shutil.move(path, os.path.join(trash_dir, uniq))
+    else:
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+
+def delete_sample(frame_path, ann_dir, set1_dir, trash_root=None):
+    """
+    Remove a sample from the dataset:
+      - original frame image
+      - its '<stem>_waypoints.npy'
+      - its set1/<stem>/ and set1_annotation/<stem>/ dirs
+
+    If trash_root is provided, move everything into trash_root/<stem>/ instead of hard deleting.
+    """
+    try:
+        stem = os.path.splitext(os.path.basename(frame_path))[0]
+        trash_dir = os.path.join(trash_root, stem) if trash_root else None
+        wp = f"{os.path.splitext(frame_path)[0]}_waypoints.npy"
+
+        _safe_move_or_delete(ann_dir,  trash_dir)
+        _safe_move_or_delete(set1_dir, trash_dir)
+        _safe_move_or_delete(wp,       trash_dir)
+        _safe_move_or_delete(frame_path, trash_dir)
+
+        return True
+    except Exception as e:
+        logger.error(f"Failed to delete sample for {frame_path}: {e}")
+        return False
+
 def get_output_dirs(output_root, frame_path):
     """
     Returns (set1_dir, ann_dir, frame_name).
@@ -228,7 +274,11 @@ def segment_with_sam2(image, waypoints_2d, output_dir=None, visualize=False, pre
 def process_interactive_mode(frames_dir, output_dir, limit=None, compute_background=False, save_interactive_result=False, model_size="base", overwrite=False):
     os.makedirs(output_dir, exist_ok=True)
 
-    frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+    frame_paths = sorted(
+        glob.glob(os.path.join(frames_dir, "*.jpg"))
+        + glob.glob(os.path.join(frames_dir, "*.jpeg"))
+        + glob.glob(os.path.join(frames_dir, "*.png"))
+    )
     if limit:
         frame_paths = frame_paths[:limit]
 
@@ -327,13 +377,29 @@ def process_interactive_mode(frames_dir, output_dir, limit=None, compute_backgro
                 precompute_thread.start()
 
             # === Interactive segmentation writes 1.png into ann_dir ===
-            mask, points, labels, is_finished = interactive_segmentation_with_predictor(
+            mask, points, labels, is_finished, marked_for_deletion = interactive_segmentation_with_predictor(
                 image,
                 projected_waypoints,
                 output_dir=ann_dir,
                 predictor=predictor1,
                 save_interactive_result=False
             )
+
+            # If user marked this frame for deletion, remove it and skip any saving
+            if marked_for_deletion:
+                trash_root = os.path.join(output_dir, "_trash")  # change to None for hard-delete
+                ok = delete_sample(frame_path, ann_dir, set1_dir, trash_root=trash_root)
+                if ok:
+                    logger.info(f"Deleted (or moved to trash) sample: {frame_path}")
+                else:
+                    logger.warning(f"Could not delete sample: {frame_path}")
+                # Reset precompute thread for safety
+                if precompute_thread and precompute_thread.is_alive():
+                    precompute_thread.join(timeout=0.1)
+                precompute_thread = None
+
+                i = next_valid_frame_index if next_valid_frame_index is not None else i + 1
+                continue
 
             logger.info(f"Completed interactive segmentation for {frame_path}")
             if is_finished:
@@ -439,6 +505,7 @@ def interactive_segmentation_with_predictor(image, initial_waypoints, output_dir
     fig, ax = plt.figure(figsize=(12, 8)), plt.gca()
 
     is_finished = False
+    marked_for_deletion = False
     
     # Function to update the display
     def update_display():
@@ -548,7 +615,7 @@ def interactive_segmentation_with_predictor(image, initial_waypoints, output_dir
     def on_key(event):
         nonlocal current_mask, user_points, user_labels, points, labels, current_logits, \
             current_score, user_points_history, user_labels_history, is_finished, \
-            waypoints, waypoint_labels, valid_traj, use_waypoints
+            waypoints, waypoint_labels, valid_traj, use_waypoints, marked_for_deletion
         
         if event.key == ' ':  # Space to save and continue
             # Save the current mask and exit
@@ -559,6 +626,9 @@ def interactive_segmentation_with_predictor(image, initial_waypoints, output_dir
         elif event.key == 'q':
             is_finished = True
             # Exit without saving
+            plt.close(fig)
+        elif event.key in ('d', 'delete'):
+            marked_for_deletion = True
             plt.close(fig)
         elif event.key == 'r':
             # Reset user points but keep waypoints
@@ -705,7 +775,8 @@ def interactive_segmentation_with_predictor(image, initial_waypoints, output_dir
     print("- Press 'backspace' to undo the last user-added point")
     print("- Press 'q' to quit without saving")
     print("- Press SPACE to save and continue to the next image")
-    
+    print("- Press 'd' (or Delete) to reject this image and remove it from the dataset")
+
     plt.show()
     
     # Save the final mask as red-on-black PNG only
@@ -713,7 +784,7 @@ def interactive_segmentation_with_predictor(image, initial_waypoints, output_dir
         save_mask_png(output_dir, current_mask, "1.png")
 
     
-    return current_mask, user_points, user_labels, is_finished
+    return current_mask, user_points, user_labels, is_finished, marked_for_deletion
 
 def process_sampled_frames(frames_dir, output_dir, limit=None, model_checkpoint="facebook/sam2-hiera-base-plus", overwrite=False):
     os.makedirs(output_dir, exist_ok=True)
@@ -819,8 +890,8 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Process sampled frames with SAM2 segmentation")
-    parser.add_argument("--frames_dir", default="/mnt/ihih/cityscapes/classified_output/zebra_crossing", help="Directory containing sampled frames")
-    parser.add_argument("--output_dir", default="out/segmentation", help="Directory to save output segmentations")
+    parser.add_argument("--frames_dir", default="/mnt/ihih/crosswalk_dataset/zebra_crossing_robot_view_20250826", help="Directory containing sampled frames")
+    parser.add_argument("--output_dir", default="/mnt/ihih/crosswalk_dataset/crosswalk_20250826", help="Directory to save output segmentations")
     parser.add_argument("--limit", type=int, help="Limit the number of frames to process")
     parser.add_argument("--single_frame", help="Process a single frame instead of a directory")
     parser.add_argument("--interactive", action="store_true", help="Enable interactive mode for refining segmentations")
@@ -834,36 +905,48 @@ if __name__ == "__main__":
     
     if args.interactive:
         if args.single_frame:
-            # Process a single frame interactively
             image, waypoints = load_sampled_frame_and_waypoints(args.single_frame)
             projected_waypoints = project_waypoints_to_image(waypoints, image.shape)
-            
-            # Create output directory based on frame name
-            frame_name = os.path.basename(args.single_frame).split('.')[0]
-            frame_output_dir = os.path.join(args.output_dir, frame_name)
-            
-            # Determine model checkpoint based on size
+
+            # Use the same set1/set1_annotation scheme for consistency
+            set1_dir, ann_dir, _ = compute_output_dirs(args.output_dir, args.single_frame)
+            os.makedirs(ann_dir, exist_ok=True)
+
             if args.model_size == "small":
                 model_checkpoint = "facebook/sam2-hiera-small"
             elif args.model_size == "tiny":
                 model_checkpoint = "facebook/sam2-hiera-tiny"
-            else:  # default to base
+            else:
                 model_checkpoint = "facebook/sam2-hiera-base-plus"
-            
-            # Initialize predictor with selected model
+
             predictor = SAM2ImagePredictor.from_pretrained(model_checkpoint)
             predictor.set_image(image)
-            
-            # Run interactive segmentation
-            interactive_segmentation_with_predictor(
-                image, 
+
+            mask, points, labels, is_finished, marked_for_deletion = interactive_segmentation_with_predictor(
+                image,
                 projected_waypoints,
-                output_dir=frame_output_dir,
+                output_dir=ann_dir,
                 predictor=predictor,
                 save_interactive_result=args.save_interactive_result
             )
-            
+
+            mask_png = os.path.join(ann_dir, "1.png")
+            if marked_for_deletion:
+                trash_root = os.path.join(args.output_dir, "_trash")  # change to None for hard-delete
+                delete_sample(args.single_frame, ann_dir, set1_dir, trash_root=trash_root)
+                logger.info(f"Deleted (or moved to trash) single-frame sample: {args.single_frame}")
+                raise SystemExit(0)
+
+            # If user didn't delete and mask exists, copy original image into set1/<frame>/1.jpg
+            if os.path.exists(mask_png):
+                os.makedirs(set1_dir, exist_ok=True)
+                dst_img = os.path.join(set1_dir, "1.jpg")
+                if not os.path.exists(dst_img) or args.overwrite:
+                    shutil.copy2(args.single_frame, dst_img)
+                    logger.info(f"Saved original image to {dst_img}")
+
             logger.info(f"Processed single frame interactively: {args.single_frame}")
+            raise SystemExit(0)
         else:
             # Process all frames in directory interactively
             process_interactive_mode(
