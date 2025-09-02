@@ -51,6 +51,7 @@ Follow the steps below to create your environment, install required dependencies
    - **Press 'x':** Remove all points (including waypoints)
    - **Press 'backspace':** Undo the last user-added point
    - **Press 'q':** Quit without saving
+   - **Press 'd':** Delete the image from the dataset
    - **Press SPACE:** Save and continue to the next image
 
 ---
