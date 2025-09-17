@@ -15,46 +15,54 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ===== dataset export helpers =====
-DATASET_ROOT = "output"
-SET_NAME = "set1"
-ANN_NAME = "set1_annotation"
+IMAGE_GLOBS = [
+    "*.jpg","*.jpeg","*.png","*.bmp","*.webp","*.tif","*.tiff",
+    "*.JPG","*.JPEG","*.PNG","*.BMP","*.WEBP","*.TIF","*.TIFF"
+]
 
-def ann_png_path(frame_path, dataset_root=DATASET_ROOT, ann_name=ANN_NAME):
+def _dataset_ann_exists(frame_path, dataset_root, ann_name="set1_annotation"):
     imname = os.path.splitext(os.path.basename(frame_path))[0]
-    return os.path.join(dataset_root, ann_name, imname, "1.png")
+    return os.path.exists(os.path.join(dataset_root, ann_name, imname, "1.png"))
 
-def already_done(frame_path, dataset_root=DATASET_ROOT, ann_name=ANN_NAME):
-    return os.path.exists(ann_png_path(frame_path, dataset_root, ann_name))
+def list_images(dir_path):
+    paths = []
+    for pat in IMAGE_GLOBS:
+        paths.extend(glob.glob(os.path.join(dir_path, pat)))
+    # de-dup + stable order
+    return sorted(set(paths))
 
-def save_to_set(image_rgb, mask, frame_path,
-                dataset_root=DATASET_ROOT,
-                set_name=SET_NAME,
-                ann_name=ANN_NAME):
+
+def _safe_rmtree(path):
+    try:
+        if path and os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+            logger.info(f"[cleanup] Deleted temp dir: {path}")
+    except Exception as e:
+        logger.warning(f"[cleanup] Failed to delete {path}: {e}")
+
+def save_to_set_dirs(image_rgb, mask, frame_path, dataset_root, set_name="set1", ann_name="set1_annotation"):
+    """
+    Write:
+      - <dataset_root>/<set_name>/<imname>/1.jpg  (RGB image)
+      - <dataset_root>/<ann_name>/<imname>/1.png  (red-on-black, mask>0)
+    """
     imname = os.path.splitext(os.path.basename(frame_path))[0]
     img_dir = os.path.join(dataset_root, set_name, imname)
     ann_dir = os.path.join(dataset_root, ann_name, imname)
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(ann_dir, exist_ok=True)
 
-    # 1) image 1.jpg (RGB->BGR for cv2)
+    # 1.jpg (keep original RGB; cv2 expects BGR)
     img_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
     cv2.imwrite(os.path.join(img_dir, "1.jpg"), img_bgr)
 
-    # 2) red mask 1.png
+    # 1.png (red-on-black with threshold=0 ⇒ mask>0)
     h, w = mask.shape[:2]
-    out = np.zeros((h, w, 3), dtype=np.uint8)
-    out[mask > 0] = (0, 0, 255)  # BGR red
-    cv2.imwrite(os.path.join(ann_dir, "1.png"), out)
-# ==================================
+    m = (mask > 0)
+    red = np.zeros((h, w, 3), dtype=np.uint8)
+    red[m] = (0, 0, 255)  # BGR red
+    cv2.imwrite(os.path.join(ann_dir, "1.png"), red)
 
-def safe_rmtree(path):
-    try:
-        if path and os.path.isdir(path):
-            shutil.rmtree(path, ignore_errors=True)
-            logger.info(f"Removed temp dir: {path}")
-    except Exception as e:
-        logger.warning(f"Failed to remove {path}: {e}")
 
 def load_sampled_frame_and_waypoints(frame_path):
     """
@@ -256,7 +264,7 @@ def process_interactive_mode(frames_dir, output_dir, limit=None, compute_backgro
     os.makedirs(output_dir, exist_ok=True)
     
     # Find all jpg files in the directory
-    frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+    frame_paths = list_images(frames_dir)
     
     if limit:
         frame_paths = frame_paths[:limit]
@@ -295,8 +303,8 @@ def process_interactive_mode(frames_dir, output_dir, limit=None, compute_backgro
             frame_output_dir = os.path.join(output_dir, frame_name)
             
             # Check if this frame has already been processed
-            if not overwrite and already_done(frame_path):
-                logger.info(f"Skipping {frame_path} (annotation exists)")
+            if _dataset_ann_exists(frame_path, output_dir, ann_name="set1_annotation"):
+                logger.info(f"Skipping {frame_name}: dataset mask already exists under {output_dir}/set1_annotation")
                 i += 1
                 continue
             
@@ -345,7 +353,10 @@ def process_interactive_mode(frames_dir, output_dir, limit=None, compute_backgro
                             # Skip if already processed and not overwriting
                             next_frame_name = os.path.basename(next_frame_path).split('.')[0]
                             next_frame_output_dir = os.path.join(output_dir, next_frame_name)
-                            if not overwrite and already_done(next_frame_path):
+                            next_mask_file = os.path.join(next_frame_output_dir, "mask.npy")
+                            next_label_file = os.path.join(next_frame_output_dir, "label.pkl")
+                            
+                            if not overwrite and (os.path.exists(next_mask_file) or os.path.exists(next_label_file)):
                                 next_idx += 1
                                 continue
                             
@@ -391,8 +402,6 @@ def process_interactive_mode(frames_dir, output_dir, limit=None, compute_backgro
             )
             
             logger.info(f"Completed interactive segmentation for {frame_path}")
-
-            safe_rmtree(frame_output_dir)
 
             if is_finished:
                 logger.info(f"User quit the interactive segmentation.")
@@ -844,8 +853,17 @@ def interactive_segmentation_with_predictor(
     plt.show()
     
     if action == "save" and output_dir is not None and current_mask is not None:
-        save_to_set(image, current_mask, frame_path)
-
+        os.makedirs(output_dir, exist_ok=True)
+        np.save(os.path.join(output_dir, "mask.npy"), current_mask)
+        with open(os.path.join(output_dir, "label.pkl"), "wb") as f:
+            pickle.dump({"valid": valid_traj, "use_waypoints": use_waypoints}, f)
+        if len(user_points) > 0:
+            h, w = image.shape[:2]
+            normalized_points = user_points.copy().astype(float)
+            normalized_points[:, 0] /= float(w)
+            normalized_points[:, 1] /= float(h)
+            np.save(os.path.join(output_dir, "points.npy"), normalized_points)
+            np.save(os.path.join(output_dir, "point_labels.npy"), user_labels)
         if save_interactive_result:
             plt.figure(figsize=(10, 10))
             plt.imshow(image)
@@ -853,14 +871,15 @@ def interactive_segmentation_with_predictor(
             mask_image = current_mask.reshape(h, w, 1) * np.array([30/255, 144/255, 255/255, 0.4]).reshape(1, 1, -1)
             plt.imshow(mask_image)
             plt.axis('off')
-            os.makedirs(output_dir, exist_ok=True)
             plt.savefig(os.path.join(output_dir, "interactive_result.png"), bbox_inches='tight')
             plt.close()
-        
-        # _save_for_set(image, current_mask, frame_path,
-        #               dataset_root="output",
-        #               set_name="set1",
-        #               ann_name="set1_annotation")
+
+        # NEW: write dataset-style outputs under the *base* output_dir
+        dataset_root = os.path.abspath(os.path.join(output_dir, os.pardir))  # parent of frame folder
+        save_to_set_dirs(image, current_mask, frame_path, dataset_root=dataset_root, set_name="set1", ann_name="set1_annotation")
+
+        _safe_rmtree(output_dir)
+
 
     elif action == "delete":
         _delete_output_dir(output_dir)
@@ -967,7 +986,7 @@ def process_sampled_frames(frames_dir, output_dir, limit=None, model_checkpoint=
     os.makedirs(output_dir, exist_ok=True)
     
     # Find all jpg files in the directory
-    frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.jpg")))
+    frame_paths = list_images(frames_dir)
     
     if limit:
         frame_paths = frame_paths[:limit]
@@ -993,49 +1012,59 @@ def process_sampled_frames(frames_dir, output_dir, limit=None, model_checkpoint=
     
     # Process each frame
     for frame_path in tqdm(frame_paths):
-        frame_name = os.path.basename(frame_path).split('.')[0]
-        frame_output_dir = os.path.join(output_dir, frame_name)  # 用于临时可视化/中间文件
         try:
-            if not overwrite and already_done(frame_path):
-                logger.info(f"Skipping {frame_path} (annotation exists)")
+            # Extract frame name for output
+            frame_name = os.path.basename(frame_path).split('.')[0]
+            frame_output_dir = os.path.join(output_dir, frame_name)
+            
+            # Check if this frame has already been processed
+            if _dataset_ann_exists(frame_path, output_dir, ann_name="set1_annotation"):
+                logger.info(f"Skipping {frame_name}: dataset mask already exists under {output_dir}/set1_annotation")
                 stats["skipped_frames"] += 1
                 continue
-
+            
             os.makedirs(frame_output_dir, exist_ok=True)
-
+            
+            # Load frame and waypoints
             image, waypoints = load_sampled_frame_and_waypoints(frame_path)
-            projected_waypoints = project_waypoints_to_image(waypoints, image.shape) if waypoints is not None else np.zeros((0, 2))
+            
+            # Project waypoints to image
+            projected_waypoints = project_waypoints_to_image(waypoints, image.shape)
+            
+            # Skip if no waypoints could be projected
             if len(projected_waypoints) == 0:
                 logger.warning(f"No waypoints could be projected for {frame_path}")
                 stats["failed_frames"] += 1
                 continue
-
+            
+            # Segment with SAM2
             masks, scores, _ = segment_with_sam2(
                 image,
                 projected_waypoints,
                 output_dir=frame_output_dir,
-                visualize=True,           
+                visualize=True,
                 predictor=predictor
             )
 
-            if masks is not None and len(masks) > 0:
-                best_idx = scores.argmax()
-                best_mask = masks[best_idx]
-                save_to_set(image, best_mask, frame_path)
-                total_masks += 1
-            else:
-                logger.warning(f"No mask predicted for {frame_path}")
-                stats["failed_frames"] += 1
-                continue
+            # Pick best mask and save single mask.npy
+            best_idx = scores.argmax()
+            best_mask = masks[best_idx]
+            np.save(os.path.join(frame_output_dir, "mask.npy"), best_mask)
 
-            total_waypoints += 0 if waypoints is None else len(waypoints)
+            # Save dataset-style outputs under the base output_dir
+            save_to_set_dirs(image, best_mask, frame_path, dataset_root=output_dir, set_name="set1", ann_name="set1_annotation")
+
+            
+            # Update statistics
+            total_waypoints += len(waypoints)
             total_projected_waypoints += len(projected_waypoints)
+            total_masks += len(masks)
+            
             stats["processed_frames"] += 1
+            
         except Exception as e:
             logger.error(f"Error processing {frame_path}: {e}")
             stats["failed_frames"] += 1
-        finally:
-            safe_rmtree(frame_output_dir)
     
     # Calculate averages
     if stats["processed_frames"] > 0:
@@ -1051,6 +1080,8 @@ def process_sampled_frames(frames_dir, output_dir, limit=None, model_checkpoint=
     logger.info(f"Average waypoints per frame: {stats['avg_waypoints_per_frame']:.2f}")
     logger.info(f"Average projected waypoints per frame: {stats['avg_projected_waypoints_per_frame']:.2f}")
     logger.info(f"Average masks per frame: {stats['avg_masks_per_frame']:.2f}")
+
+    _safe_rmtree(frame_output_dir)
     
     return stats
 
@@ -1075,7 +1106,7 @@ if __name__ == "__main__":
         if args.single_frame:
             # Process a single frame interactively
             image, waypoints = load_sampled_frame_and_waypoints(args.single_frame)
-            projected_waypoints = project_waypoints_to_image(waypoints, image.shape) if waypoints is not None else np.zeros((0, 2))
+            projected_waypoints = project_waypoints_to_image(waypoints, image.shape)
             
             # Create output directory based on frame name
             frame_name = os.path.basename(args.single_frame).split('.')[0]
@@ -1105,7 +1136,6 @@ if __name__ == "__main__":
             )
             
             logger.info(f"Processed single frame interactively: {args.single_frame}")
-            safe_rmtree(frame_output_dir)
         else:
             # Process all frames in directory interactively
             process_interactive_mode(
@@ -1120,12 +1150,16 @@ if __name__ == "__main__":
     elif args.single_frame:
         # Process a single frame
         image, waypoints = load_sampled_frame_and_waypoints(args.single_frame)
-        projected_waypoints = project_waypoints_to_image(waypoints, image.shape) if waypoints is not None else np.zeros((0, 2))
+        projected_waypoints = project_waypoints_to_image(waypoints, image.shape)
         
         # Create output directory based on frame name
         frame_name = os.path.basename(args.single_frame).split('.')[0]
         frame_output_dir = os.path.join(args.output_dir, frame_name)
         os.makedirs(frame_output_dir, exist_ok=True)
+
+        if _dataset_ann_exists(args.single_frame, args.output_dir, ann_name="set1_annotation"):
+            logger.info(f"Skipping {os.path.basename(args.single_frame)}: dataset mask already exists under {args.output_dir}/set1_annotation")
+            raise SystemExit(0)
         
         # Determine model checkpoint based on size
         if args.model_size == "small":
@@ -1137,16 +1171,19 @@ if __name__ == "__main__":
         
         # Segment with SAM2
         predictor = SAM2ImagePredictor.from_pretrained(model_checkpoint)
-        segment_with_sam2(
-            image, 
-            projected_waypoints, 
+        masks, scores, _ = segment_with_sam2(
+            image,
+            projected_waypoints,
             output_dir=frame_output_dir,
             visualize=True,
             predictor=predictor
         )
+        best_idx = scores.argmax()
+        best_mask = masks[best_idx]
+        # np.save(os.path.join(frame_output_dir, "mask.npy"), best_mask)
+        save_to_set_dirs(image, best_mask, args.single_frame, dataset_root=args.output_dir, set_name="set1", ann_name="set1_annotation")
         
         logger.info(f"Processed single frame: {args.single_frame}")
-        safe_rmtree(frame_output_dir)
     else:
         # Process all frames in directory
         # Determine model checkpoint based on size
